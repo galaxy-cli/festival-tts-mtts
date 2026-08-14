@@ -16,25 +16,33 @@ set -o nounset
 set -o pipefail
 
 # Semantic Versioning
-VERSION="1.0.1"
+VERSION="1.1.3"
 
 # Set up clean global paths
 PROGRAM_NAME=$(basename "$0")
 WORK_DIR=""
 
+# Flags tracking input sources
+INPUT_MODE=""
+TEXT_INPUT=""
+FILE_PATH=""
+
 # Displays usage guidelines following POSIX standards
 usage() {
     cat <<EOF
-Usage: ${PROGRAM_NAME} [OPTIONS] <plaintext_file>
+Usage: ${PROGRAM_NAME} [OPTIONS] [FILE]
 
-Convert a plaintext document into an MP3 at accelerated pacing and play it back.
+Convert plaintext into an MP3 at accelerated pacing and play it back.
 
 Options:
+  -c, --clipboard  Read text directly from the system clipboard
+  -f, --file       Read text from a specified plaintext FILE
+  -s, --say TEXT   Read the provided quoted string of TEXT
   -v, --version    Display version information and exit
   -h, --help       Display this help message and exit
 
 Dependencies:
-  festival (text2wave), lame, mpv
+  festival (text2wave), lame, mpv, xsel
 
 Report bugs to: <207926666+galaxy-cli@://github.com>
 EOF
@@ -47,9 +55,9 @@ version() {
     exit 0
 }
 
-# Error helper function
+# Error helper function matching ftts standard structure
 error_exit() {
-    echo "mpv3: $1" >&2
+    echo "${PROGRAM_NAME}: $1" >&2
     exit 1
 }
 
@@ -61,56 +69,121 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Auto-install missing dependencies via apt
+auto_install_dependencies() {
+    local missing_pkgs=()
+    
+    command -v text2wave &> /dev/null || missing_pkgs+=("festival")
+    command -v lame &> /dev/null || missing_pkgs+=("lame")
+    command -v mpv &> /dev/null || missing_pkgs+=("mpv")
+    command -v xsel &> /dev/null || missing_pkgs+=("xsel")
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo "${PROGRAM_NAME}: missing required system dependencies: ${missing_pkgs[*]}" >&2
+    
+    if command -v apt-get &> /dev/null; then
+        echo "Running apt update and install for missing packages..." >&2
+        sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}"
+    else
+        error_exit "required dependency installer targets apt. Please manually install: ${missing_pkgs[*]}"
+    fi
+}
+
 # GNU/POSIX argument parsing transformation
 # Translates double-dash options into single letters for standard getopts compatibility
 for arg in "$@"; do
     shift
     case "$arg" in
-        --help)    set -- "$@" "-h" ;;
-        --version) set -- "$@" "-v" ;;
-        *)         set -- "$@" "$arg" ;;
+        --help)       set -- "$@" "-h" ;;
+        --version)    set -- "$@" "-v" ;;
+        --clipboard)  set -- "$@" "-c" ;;
+        --file)       set -- "$@" "-f" ;;
+        *)            set -- "$@" "$arg" ;;
     esac
 done
 
 # Standard POSIX option loop
-while getopts "hv" opt; do
+while getopts "hvcfs:" opt; do
     case "${opt}" in
         h) usage ;;
         v) version ;;
-        *) usage ;;
+        c) 
+            [ -n "${INPUT_MODE}" ] && error_exit "Multiple input flags specified. Choose one."
+            INPUT_MODE="clipboard" 
+            ;;
+        f) 
+            [ -n "${INPUT_MODE}" ] && error_exit "Multiple input flags specified. Choose one."
+            INPUT_MODE="file" 
+            ;;
+        s) 
+            [ -n "${INPUT_MODE}" ] && error_exit "Multiple input flags specified. Choose one."
+            INPUT_MODE="say"
+            TEXT_INPUT="${OPTARG}"
+            ;;
+        *) 
+            echo "Try '${PROGRAM_NAME} --help' for more information." >&2
+            exit 1
+            ;;
     esac
 done
 shift $((OPTIND - 1))
 
-# Check for the mandatory trailing operand
-if [ "$#" -ne 1 ]; then
-    echo "mpv3: missing required plaintext file operand." >&2
-    echo "Try '${PROGRAM_NAME} --help' for more information." >&2
-    exit 1
-fi
-
-TEXT_FILE="$1"
-
-# Verify filesystem layout constraints
-if [ ! -f "${TEXT_FILE}" ]; then
-    error_exit "File '${TEXT_FILE}' not found or is not a regular file."
-fi
-
-# Verify program binaries are present in local environment paths
-for cmd in text2wave lame mpv; do
-    if ! command -v "${cmd}" &> /dev/null; then
-        error_exit "Required binary dependency '${cmd}' is missing from PATH."
+# Handle trailing file operand logic with exact matching error format layouts
+if [ "${INPUT_MODE}" = "file" ]; then
+    if [ "$#" -ne 1 ]; then
+        echo "${PROGRAM_NAME}: no input source specified" >&2
+        echo "Try '${PROGRAM_NAME} --help' for more information." >&2
+        exit 1
     fi
-done
+    FILE_PATH="$1"
+elif [ -z "${INPUT_MODE}" ]; then
+    # Fallback default: If no flags were used, treat trailing operand as a file
+    if [ "$#" -eq 1 ]; then
+        INPUT_MODE="file"
+        FILE_PATH="$1"
+    else
+        echo "${PROGRAM_NAME}: no input source specified" >&2
+        echo "Try '${PROGRAM_NAME} --help' for more information." >&2
+        exit 1
+    fi
+fi
+
+# Run the automated installer check before executing pipelines
+auto_install_dependencies
 
 # Secure dynamic file layouts
 WORK_DIR=$(mktemp -d)
+TEMP_INPUT_FILE="${WORK_DIR}/input.txt"
 TEMP_MP3="${WORK_DIR}/output.mp3"
+
+# Resolve text input into the temporary layout file
+case "${INPUT_MODE}" in
+    "clipboard")
+        echo "Reading text from system clipboard..."
+        if ! xsel --clipboard --output > "${TEMP_INPUT_FILE}"; then
+            error_exit "failed to read data from clipboard."
+        fi
+        ;;
+    "file")
+        if [ ! -f "${FILE_PATH}" ]; then
+            error_exit "File '${FILE_PATH}' not found or is not a regular file."
+        fi
+        cp "${FILE_PATH}" "${TEMP_INPUT_FILE}"
+        ;;
+esac
+
+# Guard against empty source payloads
+if [ ! -s "${TEMP_INPUT_FILE}" ]; then
+    error_exit "Resolved plain text input target is completely empty."
+fi
 
 echo "Processing text-to-speech with custom pacing..."
 
 # Pipe the audio stream securely to the LAME pipeline
-if ! text2wave -eval "(Parameter.set 'Duration_Stretch 0.7)" "${TEXT_FILE}" \
+if ! text2wave -eval "(Parameter.set 'Duration_Stretch 0.7)" "${TEMP_INPUT_FILE}" \
     | lame -m m -b 64 - "${TEMP_MP3}" &> /dev/null; then
     error_exit "TTS conversion or MP3 compression pipeline failed."
 fi
