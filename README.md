@@ -1,70 +1,53 @@
-# mpv3
+# mtts
 
-A minimalist, high-performance CLI utility that converts plaintext documents, raw strings, or clipboard contents into accelerated MP3 audio tracks using the Festival TTS engine and LAME, streaming the results directly into `mpv`.
+A fast CLI text-to-speech and playback wrapper around Festival (`text2wave`), LAME, and `mpv` that encodes text into an MP3 at accelerated pacing (`Duration_Stretch 0.7`) for `mpv` playback—and can also play an existing MP3 directly.
 
-## Prerequisites
+### Prerequisites
 
-If any core dependencies are missing, it will automatically query your `apt` package manager to update and install them on execution.
+- **festival** (provides `text2wave`): Speech synthesis engine
+- **lame**: Encodes synthesized audio into a temporary 64 kbps mono MP3
+- **mpv**: Plays synthesized MP3s or existing `.mp3` files
+- **xsel**: Required for clipboard input (`-c` / `--clipboard`)
 
-### Debian / Ubuntu
+You do not need to install everything up front—`mtts` checks the dependencies required for the mode you run and offers to install missing packages via `apt` when prompted. To install all dependencies ahead of time:
+
 ```bash
 sudo apt update && sudo apt install festival lame mpv xsel
 ```
 
-> **Note:** The `text2wave` utility used by this script is packaged inside the core `festival` library.
+### Installation
 
-## Installation
-
-Download the script, grant it executable permissions, and move it somewhere into your system's `$PATH`:
+Give the script execution permissions and place it in a directory on your `PATH`:
 
 ```bash
-chmod +x mpv3
-mv mpv3 ~/.local/bin/ # Or anywhere else in your $PATH layout
+chmod +x mtts
+mv mtts ~/.local/bin/
 ```
 
-## Usage
+### Usage
 
 ```bash
-mpv3 [OPTIONS] [FILE]
+mtts -s "Quick skim of this note"       # Synthesize a quoted string and play via mpv
+mtts --say="Quick skim of this note"    # Long option with '=' syntax
+mtts -f notes.txt                      # Synthesize a plaintext file and play via mpv
+mtts notes.txt                         # Bare text file shorthand
+mtts -c                                # Synthesize current clipboard text
+mtts recording.mp3                     # Play an existing MP3 directly via mpv
 ```
 
-### Examples
+### How It Works
 
-**Play a plain text file using default fallback layout:**
-```bash
-mpv3 notes.txt
-```
+- **Text-to-MP3 pipeline:** `mtts` writes input from `-s`, `-f`, `-c`, or a bare text file into a temporary workspace, runs `text2wave` with `Duration_Stretch 0.7` and `lame` (`-m m -b 64`), and plays the resulting MP3 in `mpv` before cleaning up temporary files on exit.
+- **Direct MP3 mode:** Passing a bare `.mp3` file bypasses `text2wave` and `lame` and launches `mpv` directly on that file.
+- **Companion to `ftts`:** Use `mtts` when you want `mpv` playback controls or direct `.mp3` playback, and `ftts` when you want live `aplay` streaming with natural clause, sentence, and paragraph pacing.
 
-**Explicitly read text using the file option:**
-```bash
-mpv3 -f notes.txt
-```
+### Options
 
-**Read text directly from your system clipboard layout:**
-```bash
-mpv3 -c
-```
-
-**Pass an instant quoted string payload directly to the engine:**
-```bash
-mpv3 -s "Hello world"
-```
-
-## Options
-
-| Option | Long Option | Description |
-| :--- | :--- | :--- |
-| `-c` | `--clipboard` | Read text directly from the system clipboard |
-| `-f` | `--file` | Read text from a specified plaintext FILE |
-| `-s` | `--say TEXT` | Read the provided quoted string of TEXT |
-| `-h` | `--help` | Show the help guidelines layout and exit |
-| `-v` | `--version` | Output version information (SemVer 2.0.0) and exit |
-
-## Error Behavior
-
-When executed without selecting an option layout or missing critical path targets, it will precisely output clear GNU-style structural failures:
-
-```text
-mpv3: no input source specified
-Try 'mpv3 --help' for more information
-```
+| Option | Argument | Description |
+| :--- | :---: | :--- |
+| `-c, --clipboard` | None | Read text from the system clipboard |
+| `-f, --file=FILE` | `FILE` | Read text from a plaintext file |
+| `-s, --say=TEXT` | `TEXT` | Speak a quoted text string |
+| `-m, --mpv` | None | Accepted for compatibility (`mpv` is always used) |
+| `-h, --help` | None | Display help message and exit |
+| `-v, --version` | None | Output version information and exit |

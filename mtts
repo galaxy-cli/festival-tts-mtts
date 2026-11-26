@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#              _   _       
+#    _ __ ___ | |_| |_ ___ 
+#   | '_ ` _ \| __| __/ __|
+#   | | | | | | |_| |_\__ \
+#   |_| |_| |_|\__|\__|___/
+#                       
+# mtts - Text-to-speech and playback utility using Festival, LAME, and MPV
+#
+# Project: https://github.com/galaxy-cli/mtts
+
+set -uo pipefail
+
+PROGRAM_NAME="${0##*/}"
+VERSION="1.2.0"
+
+usage() {
+    cat <<EOF
+Usage: ${PROGRAM_NAME} [OPTION]... [FILE | FILE.mp3]
+
+Convert text to MP3 with Festival and LAME, or play an existing MP3 via mpv.
+
+Input:
+  -c, --clipboard       read text from the system clipboard
+  -f, --file=FILE       read text from a plaintext file
+  -s, --say=TEXT        speak a quoted text string
+                        (a bare FILE.mp3 plays directly; a bare text file reads as text)
+
+Other:
+  -h, --help            display this help and exit
+  -v, --version         output version information and exit
+
+Examples:
+  ${PROGRAM_NAME} -c
+  ${PROGRAM_NAME} -f notes.txt
+  ${PROGRAM_NAME} -s "Quick skim of this note"
+  ${PROGRAM_NAME} notes.txt
+  ${PROGRAM_NAME} recording.mp3
+
+Report bugs to: <https://github.com/galaxy-cli/mtts/issues>
+EOF
+}
+
+die() {
+    echo "${PROGRAM_NAME}: $*" >&2
+    exit 1
+}
+
+pkg_for() {
+    case "$1" in
+        text2wave) echo "festival" ;;
+        *)         echo "$1" ;;
+    esac
+}
+
+check_deps() {
+    local missing_cmds=() missing_pkgs=() cmd
+    for cmd in "$@"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_cmds+=("$cmd")
+            missing_pkgs+=("$(pkg_for "$cmd")")
+        fi
+    done
+
+    if (( ${#missing_cmds[@]} > 0 )); then
+        echo "${PROGRAM_NAME}: missing required dependencies: ${missing_cmds[*]}" >&2
+        read -rp "Install via apt? [Y/n] " yn
+        if [[ "${yn:-Y}" =~ ^[Yy]$ ]]; then
+            sudo apt install -y "${missing_pkgs[@]}" || exit 1
+        else
+            exit 1
+        fi
+    fi
+}
+
+# --- ARGUMENT PARSING ---
+input_mode=""
+text_input=""
+file_path=""
+direct_mp3=""
+
+set_mode() {
+    [[ -n "$input_mode" || -n "$direct_mp3" ]] && die "multiple input sources specified"
+    input_mode="$1"
+}
+
+while [[ $# -gt 0 ]]; do
+    opt="$1"
+    has_inline_val=false
+    inline_val=""
+
+    if [[ "$opt" == --*=* ]]; then
+        has_inline_val=true
+        inline_val="${opt#*=}"
+        opt="${opt%%=*}"
+    fi
+
+    case "$opt" in
+        -c|--clipboard)
+            $has_inline_val && die "option '$opt' doesn't allow an argument"
+            set_mode "clipboard"
+            shift
+            ;;
+        -f|--file)
+            set_mode "file"
+            if $has_inline_val; then
+                file_path="$inline_val"; shift
+            else
+                (( $# < 2 )) || [[ "$2" == -* ]] && die "option requires an argument -- '$opt'"
+                file_path="$2"; shift 2
+            fi
+            ;;
+        -s|--say)
+            set_mode "say"
+            if $has_inline_val; then
+                text_input="$inline_val"; shift
+            else
+                (( $# < 2 )) || [[ "$2" == -* ]] && die "option requires an argument -- '$opt'"
+                text_input="$2"; shift 2
+            fi
+            ;;
+        -m|--mpv)
+            # Accepted for muscle-memory compatibility since mpv is always the player
+            $has_inline_val && die "option '$opt' doesn't allow an argument"
+            shift
+            ;;
+        -h|--help)
+            usage; exit 0
+            ;;
+        -v|--version)
+            echo "${PROGRAM_NAME} ${VERSION}"; exit 0
+            ;;
+        -*)
+            die "unrecognized option '$1'"
+            ;;
+        *)
+            if [[ -z "$input_mode" && -z "$direct_mp3" && "${1,,}" == *.mp3 ]]; then
+                direct_mp3="$1"; shift; continue
+            fi
+            if [[ -z "$input_mode" && -z "$direct_mp3" ]]; then
+                input_mode="file"
+                file_path="$1"
+                shift
+                continue
+            fi
+            die "extra operand '$1'"
+            ;;
+    esac
+done
+
+# --- DIRECT MP3 PLAYBACK ---
+if [[ -n "$direct_mp3" ]]; then
+    [[ -f "$direct_mp3" && -r "$direct_mp3" ]] || die "${direct_mp3}: cannot read file"
+    check_deps mpv
+    echo "${PROGRAM_NAME}: playing ${direct_mp3} via mpv..." >&2
+    exec mpv "$direct_mp3"
+fi
+
+[[ -z "$input_mode" ]] && die "no input source specified (try --help)"
+
+# --- DEPENDENCY & FILE VALIDATION ---
+deps=(text2wave lame mpv)
+[[ "$input_mode" == "clipboard" ]] && deps+=(xsel)
+check_deps "${deps[@]}"
+
+if [[ "$input_mode" == "file" ]]; then
+    [[ -f "$file_path" && -r "$file_path" ]] || die "${file_path}: cannot read file"
+    if head -c 4096 "$file_path" | grep -q $'\x00'; then
+        die "${file_path}: binary file not supported"
+    fi
+fi
+
+# --- TEMP WORKSPACE ---
+work_dir=$(mktemp -d /tmp/mtts.XXXXXX)
+temp_input="${work_dir}/input.txt"
+temp_mp3="${work_dir}/output.mp3"
+
+cleanup() {
+    [[ -n "${work_dir:-}" && -d "${work_dir:-}" ]] && rm -rf "$work_dir"
+}
+trap 'cleanup; echo -e "\n[Speech Interrupted]" >&2; exit 130' INT TERM
+trap 'cleanup' EXIT
+
+# --- RESOLVE INPUT TEXT ---
+case "$input_mode" in
+    clipboard)
+        echo "${PROGRAM_NAME}: reading text from clipboard..." >&2
+        xsel -b > "$temp_input" 2>/dev/null || die "failed to read from clipboard"
+        ;;
+    file)
+        echo "${PROGRAM_NAME}: reading text from ${file_path}..." >&2
+        cp "$file_path" "$temp_input"
+        ;;
+    say)
+        printf '%s\n' "$text_input" > "$temp_input"
+        ;;
+    *)
+        die "invalid input mode"
+        ;;
+esac
+
+[[ -s "$temp_input" ]] && [[ -n "$(tr -d '[:space:]' < "$temp_input")" ]] || die "input text is empty"
+
+# --- SYNTHESIZE MP3 & PLAY VIA MPV ---
+echo "${PROGRAM_NAME}: encoding MP3 for mpv playback..." >&2
+if ! text2wave -eval "(Parameter.set 'Duration_Stretch 0.7)" "$temp_input" 2>/dev/null \
+    | lame --quiet -m m -b 64 - "$temp_mp3"; then
+    die "TTS synthesis or MP3 encoding failed"
+fi
+
+[[ -s "$temp_mp3" ]] || die "generated MP3 is empty"
+
+echo "${PROGRAM_NAME}: playing via mpv..." >&2
+mpv "$temp_mp3"
