@@ -1,30 +1,34 @@
 #!/usr/bin/env bash
-#              _   _       
-#    _ __ ___ | |_| |_ ___ 
+#            _   _
+#    _ __ ___ | |_| |_ ___
 #   | '_ ` _ \| __| __/ __|
 #   | | | | | | |_| |_\__ \
 #   |_| |_| |_|\__|\__|___/
-#                       
-# mtts - Text-to-speech and playback utility using Festival, LAME, and MPV
 #
-# Project: https://github.com/galaxy-cli/mtts
+# mtts - Batch Festival TTS wrapper using LAME + MPV
+#
+# Projects: https://github.com/galaxy-cli/mtts
 
 set -uo pipefail
 
 PROGRAM_NAME="${0##*/}"
-VERSION="1.2.0"
+VERSION="4.0.0"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+ENGINE_PY="${REPO_ROOT}/engine/tts_engine.py"
 
 usage() {
     cat <<EOF
-Usage: ${PROGRAM_NAME} [OPTION]... [FILE | FILE.mp3]
+Usage: ${PROGRAM_NAME} [OPTION]...
 
-Convert text to MP3 with Festival and LAME, or play an existing MP3 via mpv.
+Convert text from files, clipboard, arguments, or stdin into a single MP3 stream via mpv.
 
 Input:
   -c, --clipboard       read text from the system clipboard
   -f, --file=FILE       read text from a plaintext file
   -s, --say=TEXT        speak a quoted text string
-                        (a bare FILE.mp3 plays directly; a bare text file reads as text)
+                        (reads from stdin if piped and no input flag is set)
 
 Other:
   -h, --help            display this help and exit
@@ -32,12 +36,9 @@ Other:
 
 Examples:
   ${PROGRAM_NAME} -c
-  ${PROGRAM_NAME} -f notes.txt
-  ${PROGRAM_NAME} -s "Quick skim of this note"
-  ${PROGRAM_NAME} notes.txt
-  ${PROGRAM_NAME} recording.mp3
-
-Report bugs to: <https://github.com/galaxy-cli/mtts/issues>
+  ${PROGRAM_NAME} -f article.txt
+  ${PROGRAM_NAME} -s "Hello world"
+  echo "Hello from pipe" | ${PROGRAM_NAME}
 EOF
 }
 
@@ -48,7 +49,10 @@ die() {
 
 pkg_for() {
     case "$1" in
+        lame)      echo "lame" ;;
+        mpv)       echo "mpv" ;;
         text2wave) echo "festival" ;;
+        python3)   echo "python3" ;;
         *)         echo "$1" ;;
     esac
 }
@@ -63,7 +67,7 @@ check_deps() {
     done
 
     if (( ${#missing_cmds[@]} > 0 )); then
-        echo "${PROGRAM_NAME}: missing required dependencies: ${missing_cmds[*]}" >&2
+        echo "${PROGRAM_NAME}: missing dependencies: ${missing_cmds[*]}" >&2
         read -rp "Install via apt? [Y/n] " yn
         if [[ "${yn:-Y}" =~ ^[Yy]$ ]]; then
             sudo apt install -y "${missing_pkgs[@]}" || exit 1
@@ -74,14 +78,13 @@ check_deps() {
 }
 
 # --- ARGUMENT PARSING ---
-input_mode=""
-text_input=""
+input_source=""
 file_path=""
-direct_mp3=""
+text=""
 
-set_mode() {
-    [[ -n "$input_mode" || -n "$direct_mp3" ]] && die "multiple input sources specified"
-    input_mode="$1"
+set_source() {
+    [[ -n "$input_source" ]] && die "multiple input sources specified"
+    input_source="$1"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -98,11 +101,11 @@ while [[ $# -gt 0 ]]; do
     case "$opt" in
         -c|--clipboard)
             $has_inline_val && die "option '$opt' doesn't allow an argument"
-            set_mode "clipboard"
+            set_source "clipboard"
             shift
             ;;
         -f|--file)
-            set_mode "file"
+            set_source "file"
             if $has_inline_val; then
                 file_path="$inline_val"; shift
             else
@@ -111,18 +114,13 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -s|--say)
-            set_mode "say"
+            set_source "string"
             if $has_inline_val; then
-                text_input="$inline_val"; shift
+                text="$inline_val"; shift
             else
                 (( $# < 2 )) || [[ "$2" == -* ]] && die "option requires an argument -- '$opt'"
-                text_input="$2"; shift 2
+                text="$2"; shift 2
             fi
-            ;;
-        -m|--mpv)
-            # Accepted for muscle-memory compatibility since mpv is always the player
-            $has_inline_val && die "option '$opt' doesn't allow an argument"
-            shift
             ;;
         -h|--help)
             usage; exit 0
@@ -134,46 +132,43 @@ while [[ $# -gt 0 ]]; do
             die "unrecognized option '$1'"
             ;;
         *)
-            if [[ -z "$input_mode" && -z "$direct_mp3" && "${1,,}" == *.mp3 ]]; then
-                direct_mp3="$1"; shift; continue
-            fi
-            if [[ -z "$input_mode" && -z "$direct_mp3" ]]; then
-                input_mode="file"
-                file_path="$1"
-                shift
-                continue
-            fi
+            [[ -n "$text" ]] && die "multi-word strings must be enclosed in double quotes"
             die "extra operand '$1'"
             ;;
     esac
 done
 
-# --- DIRECT MP3 PLAYBACK ---
-if [[ -n "$direct_mp3" ]]; then
-    [[ -f "$direct_mp3" && -r "$direct_mp3" ]] || die "${direct_mp3}: cannot read file"
-    check_deps mpv
-    echo "${PROGRAM_NAME}: playing ${direct_mp3} via mpv..." >&2
-    exec mpv "$direct_mp3"
+if [[ -z "$input_source" ]]; then
+    [[ ! -t 0 ]] && input_source="stdin" || die "no input source specified (try --help)"
 fi
 
-[[ -z "$input_mode" ]] && die "no input source specified (try --help)"
+# --- VALIDATION & DEPENDENCIES ---
+[[ -f "$ENGINE_PY" ]] || die "engine not found at ${ENGINE_PY}"
 
-# --- DEPENDENCY & FILE VALIDATION ---
-deps=(text2wave lame mpv)
-[[ "$input_mode" == "clipboard" ]] && deps+=(xsel)
+deps=(python3 text2wave lame mpv)
+[[ "$input_source" == "clipboard" ]] && deps+=(xsel)
 check_deps "${deps[@]}"
 
-if [[ "$input_mode" == "file" ]]; then
+if [[ "$input_source" == "file" ]]; then
     [[ -f "$file_path" && -r "$file_path" ]] || die "${file_path}: cannot read file"
+    [[ "${file_path,,}" == *.pdf ]] && die "${file_path}: PDFs not supported natively (pipe via pdftotext instead)"
     if head -c 4096 "$file_path" | grep -q $'\x00'; then
         die "${file_path}: binary file not supported"
     fi
 fi
 
-# --- TEMP WORKSPACE ---
+# --- DATA EXTRACTION ---
+case "$input_source" in
+    clipboard) text="$(xsel -b 2>/dev/null)" ;;
+    file)      text="$(<"$file_path")" ;;
+    stdin)     text="$(cat)" ;;
+    string)    ;;
+esac
+[[ -z "${text//[[:space:]]/}" ]] && die "input text is empty"
+
+# --- TEMP WORKSPACE & CLEANUP ---
 work_dir=$(mktemp -d /tmp/mtts.XXXXXX)
-temp_input="${work_dir}/input.txt"
-temp_mp3="${work_dir}/output.mp3"
+merged_mp3="${work_dir}/output.mp3"
 
 cleanup() {
     [[ -n "${work_dir:-}" && -d "${work_dir:-}" ]] && rm -rf "$work_dir"
@@ -181,34 +176,43 @@ cleanup() {
 trap 'cleanup; echo -e "\n[Speech Interrupted]" >&2; exit 130' INT TERM
 trap 'cleanup' EXIT
 
-# --- RESOLVE INPUT TEXT ---
-case "$input_mode" in
-    clipboard)
-        echo "${PROGRAM_NAME}: reading text from clipboard..." >&2
-        xsel -b > "$temp_input" 2>/dev/null || die "failed to read from clipboard"
-        ;;
-    file)
-        echo "${PROGRAM_NAME}: reading text from ${file_path}..." >&2
-        cp "$file_path" "$temp_input"
-        ;;
-    say)
-        printf '%s\n' "$text_input" > "$temp_input"
-        ;;
-    *)
-        die "invalid input mode"
-        ;;
-esac
+# --- SYNTHESIZE & ENCODE CHUNKS ---
+echo "${PROGRAM_NAME}: encoding MP3 chunks for mpv playback..." >&2
 
-[[ -s "$temp_input" ]] && [[ -n "$(tr -d '[:space:]' < "$temp_input")" ]] || die "input text is empty"
+mp3_parts=()
+idx=0
 
-# --- SYNTHESIZE MP3 & PLAY VIA MPV ---
-echo "${PROGRAM_NAME}: encoding MP3 for mpv playback..." >&2
-if ! text2wave -eval "(Parameter.set 'Duration_Stretch 0.7)" "$temp_input" 2>/dev/null \
-    | lame --quiet -m m -b 64 - "$temp_mp3"; then
-    die "TTS synthesis or MP3 encoding failed"
+while IFS=$'\t' read -r kind payload; do
+    [[ "$kind" == "WAV" && -s "$payload" ]] || continue
+    part_mp3=$(printf "%s/part_%04d.mp3" "$work_dir" "$idx")
+    ((idx++))
+
+    if lame --quiet -m m -b 64 "$payload" "$part_mp3" && [[ -s "$part_mp3" ]]; then
+        mp3_parts+=("$part_mp3")
+    fi
+    rm -f "$payload"
+done < <(
+    printf '%s\n' "$text" \
+        | python3 "$ENGINE_PY" --work-dir "$work_dir" --stretch 0.7
+)
+
+(( ${#mp3_parts[@]} > 0 )) || die "no audio chunks were generated"
+
+# --- MERGE & PLAY ---
+echo "${PROGRAM_NAME}: merging into a single MP3..." >&2
+
+if command -v ffmpeg >/dev/null 2>&1; then
+    concat_list="${work_dir}/concat.txt"
+    : > "$concat_list"
+    for p in "${mp3_parts[@]}"; do
+        printf "file '%s'\n" "$p" >> "$concat_list"
+    done
+    ffmpeg -loglevel error -y -f concat -safe 0 -i "$concat_list" -c:a libmp3lame -b:a 64k -ac 1 "$merged_mp3"
+else
+    cat "${mp3_parts[@]}" > "$merged_mp3"
 fi
 
-[[ -s "$temp_mp3" ]] || die "generated MP3 is empty"
+[[ -s "$merged_mp3" ]] || die "failed to produce merged MP3"
 
 echo "${PROGRAM_NAME}: playing via mpv..." >&2
-mpv "$temp_mp3"
+mpv --no-video "$merged_mp3"
