@@ -12,7 +12,7 @@
 set -uo pipefail
 
 PROGRAM_NAME="${0##*/}"
-VERSION="4.0.0"
+VERSION="4.1.0"
 
 ENGINE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tts-engine"
 ENGINE_PY="${ENGINE_DIR}/tts_engine.py"
@@ -184,7 +184,15 @@ merged_mp3="${work_dir}/output.mp3"
 cleanup() {
     [[ -n "${work_dir:-}" && -d "${work_dir:-}" ]] && rm -rf "$work_dir"
 }
-trap 'cleanup; echo -e "\n[Speech Interrupted]" >&2; exit 130' INT TERM
+
+on_interrupt() {
+    trap - INT TERM
+    echo -e "\n[Speech Interrupted]" >&2
+    kill -- -$$ 2>/dev/null || true
+    cleanup
+    exit 130
+}
+trap 'on_interrupt' INT TERM
 trap 'cleanup' EXIT
 
 # --- SYNTHESIZE & ENCODE CHUNKS ---
